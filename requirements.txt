@@ -6,3 +6,9 @@ scikit-learn
 scikit-optimize
 jupyter
 ipykernel
+nltk
+bertopic
+sentence-transformers
+umap-learn
+hdbscan
+plotly
