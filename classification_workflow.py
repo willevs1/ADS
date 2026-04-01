@@ -1,34 +1,28 @@
+import re
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import matplotlib.pyplot as plt
-
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
+from skopt import BayesSearchCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
 
 TRAIN_PATH = "Data/Classification_train.csv"
 TEST_PATH = "Data/Classification_test.csv"
-TARGET_COLUMN = "Credit_Score"
+OUTPUT_PATH = "Data/rf_test_predictions.csv"
+TARGET = "Credit_Score"
 
-NUMERIC_TEXT_COLS = [
-    "Annual_Income",
-    "Monthly_Inhand_Salary",
-    "Age",
-    "Num_of_Delayed_Payment",
-    "Changed_Credit_Limit",
-    "Outstanding_Debt",
-    "Amount_invested_monthly",
-    "Monthly_Balance",
-]
 
+# ahahha these are the columns I cleaned as numbers in the notebook
 NUMERIC_COLS = [
     "Age",
     "Annual_Income",
@@ -46,54 +40,36 @@ NUMERIC_COLS = [
     "Total_EMI_per_month",
     "Amount_invested_monthly",
     "Monthly_Balance",
+    "Num_of_Loan",
 ]
-
-CATEGORICAL_FILL_COLS = [
-    "Occupation",
-    "Type_of_Loan",
-    "Credit_Mix",
-    "Payment_of_Min_Amount",
-    "Payment_Behaviour",
-    "Spent",
-    "Value_Payments",
-]
-
-DROP_COLS = ["ID", "Month", "Name", "SSN"]
 
 
 def convert_credit_history(text):
+    # ahahha turns "22 Years and 4 Months" into a single number of months
     if pd.isna(text):
         return np.nan
 
-    text = str(text)
-    parts = text.replace("Years", "Year").replace("Months", "Month")
-    parts = parts.split(" and ")
-    if len(parts) != 2:
-        return np.nan
-
-    try:
-        years = int(parts[0].split()[0])
-        months = int(parts[1].split()[0])
+    match = re.search(r"(\d+)\s+Years?\s+and\s+(\d+)\s+Months?", str(text))
+    if match:
+        years = int(match.group(1))
+        months = int(match.group(2))
         return years * 12 + months
-    except (ValueError, IndexError):
-        return np.nan
+    return np.nan
 
 
 def clean_group_numeric(series):
+    # ahahha same idea as the notebook:
+    # clean weird numeric values within each customer group
     valid = series.dropna()
-    if len(valid) == 0:
-        return series
-
-    median_value = valid.median()
-
     if len(valid) < 4:
-        return series.fillna(median_value)
+        return series
 
     q1 = valid.quantile(0.02)
     q3 = valid.quantile(0.98)
     iqr = q3 - q1
     lower = q1 - 1.5 * iqr
     upper = q3 + 1.5 * iqr
+    median_value = valid.median()
 
     series = series.apply(
         lambda x: median_value if pd.notna(x) and (x < lower or x > upper) else x
@@ -101,136 +77,167 @@ def clean_group_numeric(series):
     return series.fillna(median_value)
 
 
-def basic_clean(frame):
-    frame = frame.copy()
-    frame = frame.drop(DROP_COLS, axis=1, errors="ignore")
+def load_data():
+    print("1. Loading train and test data...")
+    train = pd.read_csv(TRAIN_PATH, low_memory=False)
+    test = pd.read_csv(TEST_PATH, low_memory=False)
+    print("Train shape:", train.shape)
+    print("Test shape:", test.shape)
+    return train, test
 
-    for col in NUMERIC_TEXT_COLS:
-        if col in frame.columns:
-            frame[col] = frame[col].astype(str).str.strip()
-            frame[col] = frame[col].str.rstrip("_")
-            frame[col] = frame[col].str.replace(",", "", regex=False)
 
-    if "Credit_History_Age" in frame.columns:
-        frame["Credit_History_Age"] = frame["Credit_History_Age"].apply(convert_credit_history)
+def basic_clean(df):
+    # ahahha this is the very first cleanup
+    df = df.copy()
+    df = df.drop(["ID", "Month", "Name", "SSN"], axis=1, errors="ignore")
+
+    if "Credit_History_Age" in df.columns:
+        df["Credit_History_Age"] = df["Credit_History_Age"].apply(convert_credit_history)
 
     for col in NUMERIC_COLS:
-        if col in frame.columns:
-            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+            df[col] = df[col].str.rstrip("_")
+            df[col] = df[col].str.replace(",", "", regex=False)
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if "Type_of_Loan" in frame.columns:
-        frame["no_of_loan"] = frame["Type_of_Loan"].fillna("").apply(
-            lambda x: 0 if x == "" else len(str(x).split(","))
+    return df
+
+
+def create_no_of_loan(df):
+    # ahahha matching the notebook:
+    # build no_of_loan from Type_of_Loan, then drop the original
+    if "Type_of_Loan" in df.columns:
+        df["no_of_loan"] = df["Type_of_Loan"].fillna("").apply(
+            lambda x: 0 if str(x).strip() == "" else str(x).count(",") + 1
         )
-
-    if "Payment_Behaviour" in frame.columns:
-        payment_split = frame["Payment_Behaviour"].str.split("_", expand=True)
-        if payment_split is not None and payment_split.shape[1] >= 4:
-            frame["Spent"] = payment_split[0]
-            frame["Value_Payments"] = payment_split[2]
-
-    if "Occupation" in frame.columns:
-        frame["Occupation"] = frame["Occupation"].replace("_______", np.nan)
-    if "Credit_Mix" in frame.columns:
-        frame["Credit_Mix"] = frame["Credit_Mix"].replace("_", np.nan)
-    if "Payment_of_Min_Amount" in frame.columns:
-        frame["Payment_of_Min_Amount"] = frame["Payment_of_Min_Amount"].replace("NM", np.nan)
-    if "Payment_Behaviour" in frame.columns:
-        frame["Payment_Behaviour"] = frame["Payment_Behaviour"].replace("!@9#%8", np.nan)
-
-    return frame
+        df.drop(["Type_of_Loan", "Num_of_Loan"], axis=1, inplace=True, errors="ignore")
+    return df
 
 
-def fit_preprocessing(train):
-    train = basic_clean(train)
+def clean_numeric_by_customer(df):
+    # ahahha same grouped clean you used in the notebook
+    if "Customer_ID" not in df.columns:
+        return df
 
-    category_fill_map = {}
-    for col in CATEGORICAL_FILL_COLS:
-        if col in train.columns:
-            mode_value = train[col].mode(dropna=True)
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    numeric_cols = [col for col in numeric_cols if col != TARGET]
+
+    for col in numeric_cols:
+        df[col] = df.groupby("Customer_ID")[col].transform(clean_group_numeric)
+    return df
+
+
+def fill_main_categoricals(df):
+    # ahahha exactly the 3 main categorical fixes from the notebook
+    if "Occupation" in df.columns:
+        df["Occupation"] = df["Occupation"].replace("_______", np.nan)
+    if "Credit_Mix" in df.columns:
+        df["Credit_Mix"] = df["Credit_Mix"].replace("_", np.nan)
+    if "Payment_of_Min_Amount" in df.columns:
+        df["Payment_of_Min_Amount"] = df["Payment_of_Min_Amount"].replace("NM", np.nan)
+
+    for col in ["Occupation", "Credit_Mix", "Payment_of_Min_Amount"]:
+        if col in df.columns and "Customer_ID" in df.columns:
+            df[col] = df.groupby("Customer_ID")[col].transform(
+                lambda x: x.fillna(x.mode().iloc[0]) if not x.mode().empty else x
+            )
+            mode_value = df[col].mode(dropna=True)
             if not mode_value.empty:
-                category_fill_map[col] = mode_value.iloc[0]
-                train[col] = train[col].fillna(category_fill_map[col])
+                df[col] = df[col].fillna(mode_value.iloc[0])
 
-    numeric_fill_map = {}
-    numeric_features = train.select_dtypes(include="number").columns.tolist()
-    numeric_features = [col for col in numeric_features if col != TARGET_COLUMN]
+    return df
 
-    for col in numeric_features:
-        if "Customer_ID" in train.columns:
-            train[col] = train.groupby("Customer_ID")[col].transform(clean_group_numeric)
-        numeric_fill_map[col] = train[col].median()
-        train[col] = train[col].fillna(numeric_fill_map[col])
 
-    if "Spent" in train.columns:
-        train["Spent"] = train["Spent"].replace({"High": 1, "Low": 0})
-    if "Value_Payments" in train.columns:
-        train["Value_Payments"] = train["Value_Payments"].replace(
-            {"Small": 0, "Medium": 1, "Large": 2}
+def split_payment_behaviour(df):
+    # ahahha split Payment_Behaviour into Spent and Value_Payments like the notebook
+    if "Payment_Behaviour" not in df.columns:
+        return df
+
+    df["Payment_Behaviour"] = df["Payment_Behaviour"].replace("!@9#%8", np.nan)
+
+    if "Customer_ID" in df.columns:
+        df["Payment_Behaviour"] = df.groupby("Customer_ID")["Payment_Behaviour"].transform(
+            lambda x: x.fillna(x.mode().iloc[0]) if not x.mode().empty else x
         )
-    if "Credit_Mix" in train.columns:
-        train["Credit_Mix"] = train["Credit_Mix"].replace({"Bad": 0, "Standard": 1, "Good": 2})
-    if "Payment_of_Min_Amount" in train.columns:
-        train["Payment_of_Min_Amount"] = train["Payment_of_Min_Amount"].replace({"Yes": 1, "No": 0})
 
-    train = pd.get_dummies(train, columns=["Occupation"], drop_first=True)
-    train = train.drop(["Type_of_Loan", "Payment_Behaviour", "Customer_ID"], axis=1, errors="ignore")
-    train = train.dropna(axis=0)
+    mode_value = df["Payment_Behaviour"].mode(dropna=True)
+    if not mode_value.empty:
+        df["Payment_Behaviour"] = df["Payment_Behaviour"].fillna(mode_value.iloc[0])
 
-    feature_columns = [col for col in train.columns if col != TARGET_COLUMN]
-
-    preprocessing_state = {
-        "category_fill_map": category_fill_map,
-        "numeric_fill_map": numeric_fill_map,
-        "feature_columns": feature_columns,
-    }
-    return train, preprocessing_state
+    split_cols = df["Payment_Behaviour"].str.split("_", expand=True)
+    df["Spent"] = split_cols.iloc[:, 0]
+    df["Value_Payments"] = split_cols.iloc[:, 2]
+    df.drop(["Payment_Behaviour"], axis=1, inplace=True, errors="ignore")
+    return df
 
 
-def transform_with_preprocessing(frame, preprocessing_state):
-    frame = basic_clean(frame)
+def final_feature_cleanup(df, is_train=True):
+    # ahahha this is the last bit before modelling
+    # turn text labels into numbers where needed
+    if "Credit_Mix" in df.columns:
+        df["Credit_Mix"] = df["Credit_Mix"].replace({"Bad": 0, "Standard": 1, "Good": 2})
+        df["Credit_Mix"] = pd.to_numeric(df["Credit_Mix"], errors="coerce")
+    if "Payment_of_Min_Amount" in df.columns:
+        df["Payment_of_Min_Amount"] = df["Payment_of_Min_Amount"].replace({"Yes": 1, "No": 0})
+        df["Payment_of_Min_Amount"] = pd.to_numeric(df["Payment_of_Min_Amount"], errors="coerce")
+    if "Spent" in df.columns:
+        df["Spent"] = df["Spent"].replace({"High": 1, "Low": 0})
+        df["Spent"] = pd.to_numeric(df["Spent"], errors="coerce")
+    if "Value_Payments" in df.columns:
+        df["Value_Payments"] = df["Value_Payments"].replace({"Small": 0, "Medium": 1, "Large": 2})
+        df["Value_Payments"] = pd.to_numeric(df["Value_Payments"], errors="coerce")
 
-    for col, fill_value in preprocessing_state["category_fill_map"].items():
-        if col in frame.columns:
-            frame[col] = frame[col].fillna(fill_value)
+    # ahahha this is the notebook choice:
+    # drop occupation to reduce dummy complexity
+    df = df.drop(["Occupation"], axis=1, errors="ignore")
+    df = df.drop(["Customer_ID"], axis=1, errors="ignore")
 
-    for col, fill_value in preprocessing_state["numeric_fill_map"].items():
-        if col in frame.columns:
-            if "Customer_ID" in frame.columns:
-                frame[col] = frame.groupby("Customer_ID")[col].transform(clean_group_numeric)
-            frame[col] = frame[col].fillna(fill_value)
+    # fill leftover numeric nulls with medians
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    for col in numeric_cols:
+        if col != TARGET:
+            df[col] = df[col].fillna(df[col].median())
 
-    if "Spent" in frame.columns:
-        frame["Spent"] = frame["Spent"].replace({"High": 1, "Low": 0})
-    if "Value_Payments" in frame.columns:
-        frame["Value_Payments"] = frame["Value_Payments"].replace(
-            {"Small": 0, "Medium": 1, "Large": 2}
-        )
-    if "Credit_Mix" in frame.columns:
-        frame["Credit_Mix"] = frame["Credit_Mix"].replace({"Bad": 0, "Standard": 1, "Good": 2})
-    if "Payment_of_Min_Amount" in frame.columns:
-        frame["Payment_of_Min_Amount"] = frame["Payment_of_Min_Amount"].replace({"Yes": 1, "No": 0})
+    # ahahha this makes sure XGBoost only sees numeric columns
+    for col in df.columns:
+        if col != TARGET:
+            try:
+                df[col] = pd.to_numeric(df[col])
+            except (ValueError, TypeError):
+                pass
 
-    frame = pd.get_dummies(frame, columns=["Occupation"], drop_first=True)
-    frame = frame.drop(["Type_of_Loan", "Payment_Behaviour", "Customer_ID"], axis=1, errors="ignore")
+    if is_train:
+        df = df.dropna()
 
-    for col in preprocessing_state["feature_columns"]:
-        if col not in frame.columns:
-            frame[col] = 0
+    return df
 
-    extra_cols = [
-        col for col in frame.columns
-        if col not in preprocessing_state["feature_columns"] + [TARGET_COLUMN]
-    ]
-    if extra_cols:
-        frame = frame.drop(columns=extra_cols, errors="ignore")
 
-    ordered_cols = preprocessing_state["feature_columns"][:]
-    if TARGET_COLUMN in frame.columns:
-        ordered_cols = ordered_cols + [TARGET_COLUMN]
+def process_train(train_df):
+    print("2. Cleaning training data...")
+    train_df = basic_clean(train_df)
+    train_df = create_no_of_loan(train_df)
+    train_df = clean_numeric_by_customer(train_df)
+    train_df = fill_main_categoricals(train_df)
+    train_df = split_payment_behaviour(train_df)
+    train_df = final_feature_cleanup(train_df, is_train=True)
+    print("Processed train shape:", train_df.shape)
+    return train_df
 
-    frame = frame.reindex(columns=ordered_cols, fill_value=0)
-    return frame
+
+def process_test(test_df, train_columns):
+    print("3. Cleaning test data with same steps...")
+    test_df = basic_clean(test_df)
+    test_df = create_no_of_loan(test_df)
+    test_df = clean_numeric_by_customer(test_df)
+    test_df = fill_main_categoricals(test_df)
+    test_df = split_payment_behaviour(test_df)
+    test_df = final_feature_cleanup(test_df, is_train=False)
+
+    # ahahha line train and test columns up so the model sees the same input
+    test_df = test_df.reindex(columns=train_columns, fill_value=0)
+    print("Processed test shape:", test_df.shape)
+    return test_df
 
 
 def build_models():
@@ -240,10 +247,14 @@ def build_models():
             ("smote", SMOTE(random_state=42)),
             ("model", LogisticRegression(max_iter=1000)),
         ]),
-        "KNN": ImbPipeline([
-            ("scaler", StandardScaler()),
+        "XGBoost": ImbPipeline([
             ("smote", SMOTE(random_state=42)),
-            ("model", KNeighborsClassifier(n_neighbors=5)),
+            ("model", XGBClassifier(
+                objective="multi:softprob",
+                num_class=3,
+                eval_metric="mlogloss",
+                random_state=42,
+            )),
         ]),
         "Decision Tree": ImbPipeline([
             ("smote", SMOTE(random_state=42)),
@@ -256,163 +267,144 @@ def build_models():
     }
 
 
-def class_sensitivity_specificity(y_true, y_pred, labels):
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    results = []
+def compare_models(X_train, y_train, X_test, y_test):
+    print("4. Running the 4 main models...")
+    models = build_models()
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_results = []
+    y_map = {"Poor": 0, "Standard": 1, "Good": 2}
+    y_reverse_map = {0: "Poor", 1: "Standard", 2: "Good"}
 
-    for i, label in enumerate(labels):
-        tp = cm[i, i]
-        fn = cm[i, :].sum() - tp
-        fp = cm[:, i].sum() - tp
-        tn = cm.sum() - (tp + fn + fp)
+    for name, model in models.items():
+        print(f"   Running CV for {name}...")
+        use_y_train = y_train
+        use_y_test = y_test
 
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        # ahahha XGBoost wants the target as numbers, so just for this model
+        # we temporarily map Poor/Standard/Good to 0/1/2
+        if name == "XGBoost":
+            use_y_train = y_train.map(y_map)
+            use_y_test = y_test.map(y_map)
 
-        results.append({
-            "Class": label,
-            "Sensitivity": sensitivity,
-            "Specificity": specificity,
+        scores = cross_val_score(
+            model,
+            X_train,
+            use_y_train,
+            cv=cv,
+            scoring="accuracy",
+            n_jobs=1,
+        )
+
+        cv_results.append({
+            "Model": name,
+            "CV Mean Accuracy": scores.mean(),
+            "CV Std Accuracy": scores.std(),
         })
 
-    return pd.DataFrame(results)
+        model.fit(X_train, use_y_train)
+        y_pred = model.predict(X_test)
 
+        if name == "XGBoost":
+            y_pred = pd.Series(y_pred).map(y_reverse_map)
+            use_y_test = use_y_test.map(y_reverse_map)
 
-# -------------------------------------------------------------------
-# 1. Load raw train and test data
-# -------------------------------------------------------------------
-train_raw = pd.read_csv(TRAIN_PATH, low_memory=False)
-test_raw = pd.read_csv(TEST_PATH, low_memory=False)
+        print(f"\n{name}")
+        print("Accuracy:", round(accuracy_score(use_y_test, y_pred), 4))
+        print(classification_report(use_y_test, y_pred))
+        print(confusion_matrix(use_y_test, y_pred))
 
-print("Raw train shape:", train_raw.shape)
-print("Raw test shape:", test_raw.shape)
-
-
-# -------------------------------------------------------------------
-# 2. Fit preprocessing on train, then apply the same transformations to test
-# -------------------------------------------------------------------
-train, preprocessing_state = fit_preprocessing(train_raw)
-test = transform_with_preprocessing(test_raw, preprocessing_state)
-
-print("Processed train shape:", train.shape)
-print("Processed test shape:", test.shape)
-print(train.isnull().sum())
-print(test.isnull().sum())
-
-
-# -------------------------------------------------------------------
-# 3. Define modelling data
-# -------------------------------------------------------------------
-X = train.drop(TARGET_COLUMN, axis=1)
-y = train[TARGET_COLUMN]
-X_submission = test.copy()
-
-
-# -------------------------------------------------------------------
-# 4. Train / validation split
-# -------------------------------------------------------------------
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y,
-)
-
-
-# -------------------------------------------------------------------
-# 5. Cross-validation for fair model comparison
-# -------------------------------------------------------------------
-models = build_models()
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_results = []
-
-for name, model in models.items():
-    scores = cross_val_score(
-        model,
-        X_train,
-        y_train,
-        cv=cv,
-        scoring="accuracy",
-        n_jobs=-1,
+    cv_results_df = pd.DataFrame(cv_results).sort_values(
+        by="CV Mean Accuracy",
+        ascending=False
     )
-    cv_results.append({
-        "Model": name,
-        "CV Mean Accuracy": scores.mean(),
-        "CV Std Accuracy": scores.std(),
-    })
 
-cv_results_df = pd.DataFrame(cv_results).sort_values(
-    by="CV Mean Accuracy",
-    ascending=False,
-)
-print(cv_results_df)
+    print("\nCV Results")
+    print(cv_results_df)
+    return cv_results_df
 
 
-# -------------------------------------------------------------------
-# 6. Fit and evaluate models on the validation split
-# -------------------------------------------------------------------
-for name, model in models.items():
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+def tune_random_forest(X_train, y_train):
+    print("5. Tuning Random Forest...")
+    search_spaces = {
+        "n_estimators": (100, 250),
+        "max_depth": (5, 20),
+        "min_samples_split": (2, 10),
+        "min_samples_leaf": (1, 5),
+    }
 
-    print(f"\n{name}")
+    bayes_search = BayesSearchCV(
+        estimator=RandomForestClassifier(random_state=42),
+        search_spaces=search_spaces,
+        n_iter=10,
+        scoring="roc_auc_ovr",
+        cv=3,
+        n_jobs=1,
+        random_state=42,
+    )
+
+    bayes_search.fit(X_train, y_train)
+    print("Best RF Parameters:", bayes_search.best_params_)
+    print("Best RF AUC:", bayes_search.best_score_)
+    return bayes_search
+
+
+def fit_best_rf_and_predict(X_train, y_train, X_test, y_test, X_submission, best_params):
+    print("6. Fitting tuned RF and scoring test data...")
+
+    smote = SMOTE(random_state=42)
+
+    # ahahha first fit on the train split so we can see validation performance
+    X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+    best_rf = RandomForestClassifier(**best_params, random_state=42)
+    best_rf.fit(X_train_smote, y_train_smote)
+
+    y_pred = best_rf.predict(X_test)
+    print("\nTuned Random Forest Validation Results")
     print("Accuracy:", round(accuracy_score(y_test, y_pred), 4))
     print(classification_report(y_test, y_pred))
     print(confusion_matrix(y_test, y_pred))
 
-
-# -------------------------------------------------------------------
-# 7. Plot confusion matrices
-# -------------------------------------------------------------------
-labels = sorted(y_test.unique())
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-axes = axes.flatten()
-
-for i, (name, model) in enumerate(models.items()):
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    cm = confusion_matrix(y_test, y_pred, labels=labels)
-
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt="d",
-        cmap="Blues",
-        xticklabels=labels,
-        yticklabels=labels,
-        ax=axes[i],
+    # ahahha now fit on all the train data and predict the real test csv
+    X_all_smote, y_all_smote = smote.fit_resample(
+        pd.concat([X_train, X_test]),
+        pd.concat([y_train, y_test]),
     )
-    axes[i].set_title(name)
-    axes[i].set_xlabel("Predicted")
-    axes[i].set_ylabel("Actual")
+    final_rf = RandomForestClassifier(**best_params, random_state=42)
+    final_rf.fit(X_all_smote, y_all_smote)
 
-plt.tight_layout()
-plt.show()
+    test_predictions = final_rf.predict(X_submission)
+    test_predictions_df = pd.DataFrame({
+        "Predicted_Credit_Score": test_predictions
+    })
+    test_predictions_df.to_csv(OUTPUT_PATH, index=False)
 
-
-# -------------------------------------------------------------------
-# 8. Sensitivity and specificity
-# -------------------------------------------------------------------
-for name, model in models.items():
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    metrics_df = class_sensitivity_specificity(y_test, y_pred, labels)
-    metrics_df["Model"] = name
-
-    print(f"\n{name}")
-    print(metrics_df)
+    print("\nSaved predictions to:", OUTPUT_PATH)
+    print(test_predictions_df.head())
+    return test_predictions_df
 
 
-# -------------------------------------------------------------------
-# 9. Fit a final model on all processed train rows and score test CSV
-# -------------------------------------------------------------------
-final_model = build_models()["Random Forest"]
-final_model.fit(X, y)
-test_predictions = final_model.predict(X_submission)
+def run_workflow():
+    train_raw, test_raw = load_data()
 
-test_predictions_df = pd.DataFrame({
-    "Predicted_Credit_Score": test_predictions,
-})
+    train = process_train(train_raw)
+    X = train.drop(TARGET, axis=1)
+    y = train[TARGET]
 
-print(test_predictions_df.head())
+    test = process_test(test_raw, X.columns)
+
+    print("4a. Splitting train/validation...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y,
+    )
+
+    compare_models(X_train, y_train, X_test, y_test)
+    rf_search = tune_random_forest(X_train, y_train)
+    fit_best_rf_and_predict(X_train, y_train, X_test, y_test, test, rf_search.best_params_)
+
+
+if __name__ == "__main__":
+    run_workflow()
